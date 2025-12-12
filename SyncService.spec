@@ -2,7 +2,7 @@
 from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('config.json', '.'), ('.env', '.'), ('django_sync', 'django_sync')]
+datas = [('config.json', '.'), ('.env', '.'), ('django_sync', 'django_sync'), ('db.sqlite3', '.')]
 binaries = []
 hiddenimports = []
 hiddenimports += collect_submodules('django')

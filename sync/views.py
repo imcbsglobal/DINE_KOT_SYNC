@@ -178,7 +178,6 @@ def verify_token(request):
     logging.info("✅ Token verified for user: %s", request.userid)
     return JsonResponse({"status": "success", "userid": request.userid})
 
-
 @jwt_required
 @require_http_methods(["GET"])
 def data_download(request):
@@ -187,16 +186,27 @@ def data_download(request):
     cur = conn.cursor()
 
     try:
+        # MASTER DATA
         cur.execute("SELECT code, name, place FROM acc_master WHERE super_code = 'SUNCR'")
         master_rows = cur.fetchall()
         master_data = [{"code": r[0], "name": r[1], "place": r[2]} for r in master_rows]
 
+        # PRODUCT + BATCH (text1 added)
         cur.execute("""
-            SELECT p.code, p.name, pb.barcode, pb.quantity, pb.salesprice, pb.bmrp, pb.cost
+            SELECT 
+                p.code, 
+                p.name, 
+                pb.barcode, 
+                pb.quantity, 
+                pb.salesprice, 
+                pb.bmrp, 
+                pb.cost,
+                pb.text1
             FROM acc_product p
             LEFT JOIN acc_productbatch pb ON p.code = pb.productcode
         """)
         product_rows = cur.fetchall()
+
         product_data = [
             {
                 "code": r[0],
@@ -206,18 +216,28 @@ def data_download(request):
                 "salesprice": _to_float(r[4]),
                 "bmrp": _to_float(r[5]),
                 "cost": _to_float(r[6]),
+                "text1": r[7],        # ✅ NEW FIELD ADDED
             }
             for r in product_rows
         ]
-        return JsonResponse({"status": "success", "master_data": master_data, "product_data": product_data})
+
+        return JsonResponse({
+            "status": "success",
+            "master_data": master_data,
+            "product_data": product_data
+        })
+
     except Exception as e:
         logging.exception("data_download failed")
         return JsonResponse({"detail": f"Failed to download: {e}"}, status=500)
+
     finally:
         try:
-            cur.close(); conn.close()
+            cur.close()
+            conn.close()
         except Exception:
             pass
+
 
 
 # ------------------------------------------------------------------
@@ -322,32 +342,6 @@ def _to_float(x, default=0.0):
 @jwt_required
 @require_http_methods(["POST"])
 def upload_orders(request):
-    """
-    Expects JSON:
-    {
-      "orders": [
-        {
-          "supplier_code": "SUP001",
-          "user_id": "1",
-          "barcode": "8901234567890",
-          "quantity": 10,
-          "rate": 100.5,
-          "mrp": 150.0,
-          "order_date": "2025-10-28",
-          "discount": 0,
-          "pnfcharges": 0,
-          "exceiseduty": 0,
-          "salestax": 0,
-          "freightcharge": 0,
-          "othercharges": 0,
-          "cessoned": 0,
-          "cess": 0,
-          "ioflag": 0              # <-- optional (0 for regular, -100 for manual)
-        }
-      ],
-      "total_orders": 1
-    }
-    """
     try:
         payload = json.loads(request.body or b"{}")
     except Exception:
@@ -367,11 +361,12 @@ def upload_orders(request):
     def _d3(x):
         return (_to_decimal(x)).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
 
-    # ---------- GROUP / NORMALIZE (make sure we keep ioflag) ----------
+    # ------------ GROUPING ------------
     groups = {}
     for r in raw_orders:
         key = (str(r.get("supplier_code") or "").strip(),
                str(r.get("order_date") or "").strip())
+
         g = groups.setdefault(key, {
             "supplier_code": key[0],
             "order_date": key[1],
@@ -386,9 +381,9 @@ def upload_orders(request):
             "quantity": r.get("quantity"),
             "rate":     r.get("rate"),
             "mrp":      r.get("mrp"),
-            "ioflag":   r.get("ioflag"),  # ✅ carry it forward
-            "code":     r.get("code"),     # for manual entries
-            "item":     r.get("item")      # for manual entries
+            "ioflag":   r.get("ioflag"),
+            "code":     r.get("code"),
+            "item":     r.get("item")
         })
 
         for k in money_keys_13_3:
@@ -415,7 +410,7 @@ def upload_orders(request):
             userid    = order.get("userid")
             otype     = "O"
 
-            # header total
+            # ---------- HEADER TOTAL ----------
             header_total = Decimal("0")
             for prod in (order.get("products") or []):
                 header_total += _to_decimal(prod.get("quantity")) * _to_decimal(prod.get("rate"))
@@ -424,6 +419,7 @@ def upload_orders(request):
             c13 = {k: _d3(v) for k, v in order["charges_13_3"].items()}
             c12 = {k: _d3(v) for k, v in order["charges_12_3"].items()}
 
+            # ---------- INSERT MASTER ----------
             cur.execute("""
                 INSERT INTO acc_purchaseordermaster
                     (slno, orderno, orderdate, supplier, otype, userid,
@@ -438,7 +434,7 @@ def upload_orders(request):
                 float(c12["cessoned"]), float(c12["cess"]),
             ))
 
-            # ---------- DETAILS INSERT (HANDLE MANUAL ENTRIES & REGULAR PRODUCTS) ----------
+            # ------------ INSERT DETAILS ------------
             for prod in (order.get("products") or []):
                 det_slno = _next_detail_slno(cur)
 
@@ -446,130 +442,74 @@ def upload_orders(request):
                 rate = _to_float(prod.get("rate"))
                 mrp  = _to_float(prod.get("mrp"))
                 barcode = str(prod.get("barcode") or "").strip()
-                ioflag  = prod.get("ioflag")  # -100 for manual, 0 for regular
-                
-                # Get manual entry fields
+                ioflag  = prod.get("ioflag")
+
                 manual_code = str(prod.get("code") or "").strip()
                 manual_item = str(prod.get("item") or "").strip()
 
-                logging.info("=" * 60)
-                logging.info(f"📦 Processing product:")
-                logging.info(f"   barcode: '{barcode}'")
-                logging.info(f"   ioflag: {ioflag}")
-                logging.info(f"   manual_code: '{manual_code}'")
-                logging.info(f"   manual_item: '{manual_item}'")
-                
                 product_code = None
                 product_name = None
-                item_value = None
                 final_barcode = barcode
-                
-                # ✅ CHECK IF MANUAL ENTRY (ioflag = -100)
+
+                # -------- MANUAL ENTRY --------
                 if ioflag == -100:
-                    logging.info("   🎯 MANUAL ENTRY DETECTED")
-                    
-                    # For manual entries:
-                    # - item: use the manual_item (product name from user input)
-                    # - barcode: use manual_code (which is the barcode user entered)
-                    
-                    if manual_item and manual_item.lower() != "barcode":
-                        item_value = manual_item
-                        logging.info(f"   ✓ Using manual item name: '{item_value}'")
-                    
-                    if manual_code and manual_code.lower() != "barcode":
-                        final_barcode = manual_code
-                        logging.info(f"   ✓ Using manual code as barcode: '{final_barcode}'")
-                    elif not barcode or barcode.lower() == "barcode":
-                        final_barcode = manual_code or "MANUAL"
-                        logging.info(f"   ⚠️ Fixed invalid barcode to: '{final_barcode}'")
-                    
-                    # Fallback if item is still not set
-                    if not item_value or item_value.lower() == "barcode":
-                        item_value = final_barcode or "Manual Entry"
-                        logging.info(f"   ⚠️ Using fallback item: '{item_value}'")
-                    
+                    item_value = manual_item or manual_code or "Manual Entry"
+                    final_barcode = manual_code or final_barcode or "MANUAL"
+
                 else:
-                    # ✅ REGULAR PRODUCT - LOOKUP FROM DATABASE
-                    logging.info("   📋 REGULAR PRODUCT")
-                    
-                    if barcode and barcode.lower() != "barcode":
-                        try:
-                            cur.execute("SELECT productcode FROM acc_productbatch WHERE barcode = ?", (barcode,))
-                            row = cur.fetchone()
-                            if row:
-                                product_code = row[0]
-                                logging.info(f"   ✓ Found productcode: {product_code}")
-                            else:
-                                logging.warning(f"   ⚠️ No productcode found for barcode: {barcode}")
-                        except Exception as e:
-                            logging.error(f"   ❌ Error looking up barcode: {e}")
+                    # -------- REGULAR PRODUCT LOOKUP --------
+                    if barcode:
+                        cur.execute("SELECT productcode FROM acc_productbatch WHERE barcode = ?", (barcode,))
+                        row = cur.fetchone()
+                        if row:
+                            product_code = row[0]
 
-                    # Get product name from productcode
-                    if product_code:
-                        try:
-                            cur.execute("SELECT name FROM acc_product WHERE code = ?", (product_code,))
-                            name_row = cur.fetchone()
-                            if name_row:
-                                product_name = name_row[0]
-                                logging.info(f"   ✓ Found product name: {product_name}")
-                            else:
-                                logging.warning(f"   ⚠️ No product name found for code: {product_code}")
-                        except Exception as e:
-                            logging.error(f"   ❌ Error looking up product name: {e}")
+                    # ✔ FIX: For normal items, store product_code (NOT product_name)
+                    item_value = product_code or barcode or "UNKNOWN"
 
-                    # Determine final item value
-                    if product_name:
-                        item_value = product_name
-                        logging.info(f"   ✅ Using product name: '{item_value}'")
-                    elif product_code:
-                        item_value = product_code
-                        logging.info(f"   ⚠️ Using product code: '{item_value}'")
-                    else:
-                        item_value = barcode if barcode and barcode.lower() != "barcode" else "UNKNOWN"
-                        logging.info(f"   ⚠️ Using fallback: '{item_value}'")
-
-                # Final validation and truncation
+                # Keep original trimming rule
                 item_value = (item_value or "UNKNOWN").strip()[:30]
                 final_barcode = (final_barcode or "NOBARCODE").strip()
+
+                # manual → store itemdetails
+                # normal → NULL
+                itemdetails_value = item_value if ioflag == -100 else None
+
                 taxcode_value = "NT"
 
-                logging.info(f"💾 Final values for insert:")
-                logging.info(f"   item: '{item_value}'")
-                logging.info(f"   barcode: '{final_barcode}'")
-                logging.info(f"   qty: {qty}, rate: {rate}, mrp: {mrp}")
-                logging.info(f"   ioflag: {ioflag}")
-
+                # -------- INSERT DETAIL --------
                 cur.execute("""
                     INSERT INTO acc_purchaseorderdetails
-                        (slno, masterslno, item, barcode, qty, rate, mrp, taxcode, ioflag, itemdetails)
+                        (slno, masterslno, item, barcode, qty, rate, mrp,
+                         taxcode, ioflag, itemdetails)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    det_slno, masterslno, item_value, final_barcode, qty, rate, mrp,
-                    taxcode_value, ioflag, item_value  # 👈 same product name stored in itemdetails
+                    det_slno, masterslno, item_value, final_barcode,
+                    qty, rate, mrp, taxcode_value, ioflag,
+                    itemdetails_value
                 ))
-                
-                logging.info(f"   ✅ Detail inserted successfully")
-                logging.info("=" * 60)
 
             created.append(masterslno)
 
         conn.commit()
-        logging.info("✅ COMMITTED – created masters: %s", created)
         return JsonResponse({
             "status": "success",
             "message": "Orders uploaded successfully",
             "entries_created": len(created),
             "masterslno_list": created
         })
+
     except Exception as exc:
         conn.rollback()
         logging.exception("❌ ROLLBACK – %s", exc)
         return JsonResponse({"detail": f"Upload failed: {exc}"}, status=500)
+
     finally:
         try:
             cur.close(); conn.close()
         except Exception:
             pass
+
 
 
 
@@ -645,3 +585,68 @@ def get_product_details(request):
             cur.close(); conn.close()
         except Exception:
             pass
+
+
+
+
+
+
+
+
+# SELECT
+#     po.orderno,
+#     po.orderdate,
+#     po.supplier,
+
+#     -- MASTER FIELDS
+#     po.total,
+#     po.discount,
+#     po.pnfcharges,
+#     po.exceiseduty,
+#     po.salestax,
+#     po.freightcharge,
+#     po.othercharges,
+#     po.cessonED,
+#     po.cess,
+
+#     -- DETAILS FIELDS
+#     pd.slno AS detail_slno,
+#     pd.item AS product_code_or_name,
+#     pd.barcode,
+#     pd.qty AS quantity,
+#     pd.rate AS cost,
+#     pd.mrp,
+#     pd.taxcode,
+#     pd.ioflag,
+#     pd.itemdetails AS manual_item,     -- 🆕 Manual entry name
+
+#     -- PRODUCT TABLE FIELDS
+#     p.name        AS product_name,
+#     p.catagory,
+#     p.brand,
+#     p.unit,
+#     p.taxcode     AS product_taxcode,
+
+#     -- BATCH FIELDS
+#     pb.productcode,
+#     pb.quantity   AS batch_quantity,
+#     pb.cost       AS batch_cost,
+#     pb.bmrp       AS batch_mrp,
+#     pb.salesprice AS batch_salesprice,
+#     pb.secondprice,
+#     pb.thirdprice,
+#     pb.expirydate
+
+# FROM acc_purchaseordermaster po
+# JOIN acc_purchaseorderdetails pd 
+#       ON pd.masterslno = po.slno
+
+# LEFT JOIN acc_productbatch pb 
+#       ON pb.barcode = pd.barcode
+
+# LEFT JOIN acc_product p 
+#       ON p.code = pb.productcode
+
+# WHERE po.orderdate = TODAY()        -- 🔥 only today's orders
+# ORDER BY pd.slno DESC;
+
