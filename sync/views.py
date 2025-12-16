@@ -178,340 +178,6 @@ def verify_token(request):
     logging.info("✅ Token verified for user: %s", request.userid)
     return JsonResponse({"status": "success", "userid": request.userid})
 
-@jwt_required
-@require_http_methods(["GET"])
-def data_download(request):
-    logging.info("📥 Data download request")
-    conn = get_connection()
-    cur = conn.cursor()
-
-    try:
-        # MASTER DATA
-        cur.execute("SELECT code, name, place FROM acc_master WHERE super_code = 'SUNCR'")
-        master_rows = cur.fetchall()
-        master_data = [{"code": r[0], "name": r[1], "place": r[2]} for r in master_rows]
-
-        # PRODUCT + BATCH (text1 added)
-        cur.execute("""
-            SELECT 
-                p.code, 
-                p.name, 
-                pb.barcode, 
-                pb.quantity, 
-                pb.salesprice, 
-                pb.bmrp, 
-                pb.cost,
-                pb.text1
-            FROM acc_product p
-            LEFT JOIN acc_productbatch pb ON p.code = pb.productcode
-        """)
-        product_rows = cur.fetchall()
-
-        product_data = [
-            {
-                "code": r[0],
-                "name": r[1],
-                "barcode": r[2],
-                "quantity": _to_float(r[3]),
-                "salesprice": _to_float(r[4]),
-                "bmrp": _to_float(r[5]),
-                "cost": _to_float(r[6]),
-                "text1": r[7],        # ✅ NEW FIELD ADDED
-            }
-            for r in product_rows
-        ]
-
-        return JsonResponse({
-            "status": "success",
-            "master_data": master_data,
-            "product_data": product_data
-        })
-
-    except Exception as e:
-        logging.exception("data_download failed")
-        return JsonResponse({"detail": f"Failed to download: {e}"}, status=500)
-
-    finally:
-        try:
-            cur.close()
-            conn.close()
-        except Exception:
-            pass
-
-
-
-# ------------------------------------------------------------------
-#  helper that returns the next PK for acc_purchaseorderdetails
-# ------------------------------------------------------------------
-def _next_detail_slno(cur):
-    cur.execute("SELECT MAX(slno) FROM acc_purchaseorderdetails")
-    row = cur.fetchone()[0]
-    return int(row or 0) + 1
-
-
-# ------------------------------------------------------------------
-#  group flat rows into one entry (one master) by entry key
-# ------------------------------------------------------------------
-def _group_orders(raw_orders):
-    """
-    Normalizes 'orders' into a list of:
-      { supplier_code, order_date, userid, otype, products:[{barcode,quantity,rate,mrp}, ...] }
-    Supports:
-      A) Already-grouped objects with 'products'
-      B) Many flat rows for the same entry (entry_no/entryid/orderno)
-    """
-    if any(isinstance(o.get("products"), list) and o["products"] for o in raw_orders):
-        normalized = []
-        for o in raw_orders:
-            products = o.get("products") or []
-            if not products and all(k in o for k in ("barcode", "quantity", "rate", "mrp")):
-                products = [{
-                    "barcode":  o["barcode"],
-                    "quantity": o["quantity"],
-                    "rate":     o["rate"],
-                    "mrp":      o["mrp"]
-                }]
-            normalized.append({
-                "supplier_code": o["supplier_code"],
-                "order_date":    _coerce_date(o.get("order_date")),
-                "userid":        o.get("userid"),
-                "otype":         o.get("otype", "O"),
-                "products":      products
-            })
-        return normalized
-
-    # flat → grouped
-    buckets = {}
-    for r in raw_orders:
-        key = (
-            r.get("entry_no")
-            or r.get("entryno")
-            or r.get("entryid")
-            or r.get("orderno")
-            or f"{r.get('supplier_code')}|{r.get('order_date')}"
-        )
-        b = buckets.setdefault(key, {
-            "supplier_code": r["supplier_code"],
-            "order_date":    _coerce_date(r.get("order_date")),
-            "userid":        r.get("userid"),
-            "otype":         r.get("otype", "O"),
-            "products":      []
-        })
-        b["products"].append({
-            "barcode":  r["barcode"],
-            "quantity": r["quantity"],
-            "rate":     r["rate"],
-            "mrp":      r["mrp"]
-        })
-    return list(buckets.values())
-
-
-
-
-
-
-
-
-def _to_decimal(x, default="0"):
-    """
-    Safely coerce numbers into Decimal for money math.
-    Returns Decimal(default) if x is None/invalid.
-    """
-    try:
-        if x is None:
-            return Decimal(default)
-        if isinstance(x, Decimal):
-            return x
-        return Decimal(str(x))
-    except Exception:
-        return Decimal(default)
-
-def _to_float(x, default=0.0):
-    try:
-        if x is None:
-            return float(default)
-        return float(x)
-    except Exception:
-        return float(default)
-
-
-# ------------------------------------------------------------------
-#  upload_orders – ONE masterslno per logical entry (items share it)
-# ------------------------------------------------------------------
-@csrf_exempt
-@jwt_required
-@require_http_methods(["POST"])
-def upload_orders(request):
-    try:
-        payload = json.loads(request.body or b"{}")
-    except Exception:
-        return JsonResponse({"detail": "Invalid JSON"}, status=400)
-
-    raw_orders = payload.get("orders") or []
-    if not raw_orders:
-        return JsonResponse({"detail": "No orders supplied"}, status=400)
-
-    logging.info("📤 Uploading %s raw orders (pre-normalization)", len(raw_orders))
-    logging.info("📦 Raw JSON received: %s", json.dumps(payload, indent=2))
-
-    money_keys_13_3 = ["discount", "pnfcharges", "exceiseduty", "salestax",
-                       "freightcharge", "othercharges"]
-    money_keys_12_3 = ["cessoned", "cess"]
-
-    def _d3(x):
-        return (_to_decimal(x)).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
-
-    # ------------ GROUPING ------------
-    groups = {}
-    for r in raw_orders:
-        key = (str(r.get("supplier_code") or "").strip(),
-               str(r.get("order_date") or "").strip())
-
-        g = groups.setdefault(key, {
-            "supplier_code": key[0],
-            "order_date": key[1],
-            "userid": r.get("user_id") or r.get("userid"),
-            "products": [],
-            "charges_13_3": {k: Decimal("0.000") for k in money_keys_13_3},
-            "charges_12_3": {k: Decimal("0.000") for k in money_keys_12_3},
-        })
-
-        g["products"].append({
-            "barcode":  r.get("barcode"),
-            "quantity": r.get("quantity"),
-            "rate":     r.get("rate"),
-            "mrp":      r.get("mrp"),
-            "ioflag":   r.get("ioflag"),
-            "code":     r.get("code"),
-            "item":     r.get("item")
-        })
-
-        for k in money_keys_13_3:
-            g["charges_13_3"][k] += _to_decimal(r.get(k, 0))
-        for k in money_keys_12_3:
-            g["charges_12_3"][k] += _to_decimal(r.get(k, 0))
-
-    orders = list(groups.values())
-    logging.info("🧩 Normalized into %s grouped entries", len(orders))
-
-    conn = get_connection()
-    cur  = conn.cursor()
-    try:
-        cur.execute("SELECT MAX(slno) FROM acc_purchaseordermaster")
-        max_masterslno = int(cur.fetchone()[0] or 0)
-
-        created = []
-        for order in orders:
-            max_masterslno += 1
-            masterslno = max_masterslno
-
-            supplier  = order["supplier_code"]
-            orderdate = order["order_date"]
-            userid    = order.get("userid")
-            otype     = "O"
-
-            # ---------- HEADER TOTAL ----------
-            header_total = Decimal("0")
-            for prod in (order.get("products") or []):
-                header_total += _to_decimal(prod.get("quantity")) * _to_decimal(prod.get("rate"))
-            header_total = header_total.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
-
-            c13 = {k: _d3(v) for k, v in order["charges_13_3"].items()}
-            c12 = {k: _d3(v) for k, v in order["charges_12_3"].items()}
-
-            # ---------- INSERT MASTER ----------
-            cur.execute("""
-                INSERT INTO acc_purchaseordermaster
-                    (slno, orderno, orderdate, supplier, otype, userid,
-                     total, discount, pnfcharges, exceiseduty, salestax,
-                     freightcharge, othercharges, cessonED, cess)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                masterslno, masterslno, orderdate, supplier, otype, userid,
-                float(header_total),
-                float(c13["discount"]), float(c13["pnfcharges"]), float(c13["exceiseduty"]),
-                float(c13["salestax"]), float(c13["freightcharge"]), float(c13["othercharges"]),
-                float(c12["cessoned"]), float(c12["cess"]),
-            ))
-
-            # ------------ INSERT DETAILS ------------
-            for prod in (order.get("products") or []):
-                det_slno = _next_detail_slno(cur)
-
-                qty  = _to_float(prod.get("quantity"))
-                rate = _to_float(prod.get("rate"))
-                mrp  = _to_float(prod.get("mrp"))
-                barcode = str(prod.get("barcode") or "").strip()
-                ioflag  = prod.get("ioflag")
-
-                manual_code = str(prod.get("code") or "").strip()
-                manual_item = str(prod.get("item") or "").strip()
-
-                product_code = None
-                product_name = None
-                final_barcode = barcode
-
-                # -------- MANUAL ENTRY --------
-                if ioflag == -100:
-                    item_value = manual_item or manual_code or "Manual Entry"
-                    final_barcode = manual_code or final_barcode or "MANUAL"
-
-                else:
-                    # -------- REGULAR PRODUCT LOOKUP --------
-                    if barcode:
-                        cur.execute("SELECT productcode FROM acc_productbatch WHERE barcode = ?", (barcode,))
-                        row = cur.fetchone()
-                        if row:
-                            product_code = row[0]
-
-                    # ✔ FIX: For normal items, store product_code (NOT product_name)
-                    item_value = product_code or barcode or "UNKNOWN"
-
-                # Keep original trimming rule
-                item_value = (item_value or "UNKNOWN").strip()[:30]
-                final_barcode = (final_barcode or "NOBARCODE").strip()
-
-                # manual → store itemdetails
-                # normal → NULL
-                itemdetails_value = item_value if ioflag == -100 else None
-
-                taxcode_value = "NT"
-
-                # -------- INSERT DETAIL --------
-                cur.execute("""
-                    INSERT INTO acc_purchaseorderdetails
-                        (slno, masterslno, item, barcode, qty, rate, mrp,
-                         taxcode, ioflag, itemdetails)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    det_slno, masterslno, item_value, final_barcode,
-                    qty, rate, mrp, taxcode_value, ioflag,
-                    itemdetails_value
-                ))
-
-            created.append(masterslno)
-
-        conn.commit()
-        return JsonResponse({
-            "status": "success",
-            "message": "Orders uploaded successfully",
-            "entries_created": len(created),
-            "masterslno_list": created
-        })
-
-    except Exception as exc:
-        conn.rollback()
-        logging.exception("❌ ROLLBACK – %s", exc)
-        return JsonResponse({"detail": f"Upload failed: {exc}"}, status=500)
-
-    finally:
-        try:
-            cur.close(); conn.close()
-        except Exception:
-            pass
-
-
-
 
 
 
@@ -544,109 +210,273 @@ def get_status(request):
 
 @jwt_required
 @require_http_methods(["GET"])
-def get_product_details(request):
-    """
-    Returns combined product details from acc_product and acc_productbatch (joined on code=productcode)
-    """
-    logging.info("📦 Product details request")
-    conn = get_connection()
-    cur = conn.cursor()
+def get_items(request):
+    item_code = request.GET.get("item_code")
+
     try:
-        cur.execute("""
-            SELECT 
-                p.code, p.name, p.catagory, p.product, p.brand, p.unit, p.taxcode,
-                pb.productcode, pb.barcode, pb.quantity, pb.cost, pb.bmrp,
-                pb.salesprice, pb.secondprice, pb.thirdprice, pb.supplier, pb.expirydate
-            FROM acc_product p
-            LEFT JOIN acc_productbatch pb ON p.code = pb.productcode
-            ORDER BY p.code
-        """)
+        conn = get_connection()
+        cur = conn.cursor()
+
+        if item_code:
+            cur.execute("""
+                SELECT
+                    i.item_code,
+                    i.item_name,
+                    i.rate,
+                    i.rate1,
+                    i.rate2,
+                    i.kitchen,
+                    i.activity,
+                    i.image,
+                    c.name,
+                    i.taxper,
+                    i.longname
+                FROM tb_item_master i
+                LEFT JOIN dine_itemcategory c
+                    ON i.category = c.code
+                WHERE i.item_code = ?
+            """, (item_code,))
+        else:
+            cur.execute("""
+                SELECT
+                    i.item_code,
+                    i.item_name,
+                    i.rate,
+                    i.rate1,
+                    i.rate2,
+                    i.kitchen,
+                    i.activity,
+                    i.image,
+                    c.name,
+                    i.taxper,
+                    i.longname
+                FROM tb_item_master i
+                LEFT JOIN dine_itemcategory c
+                    ON i.category = c.code
+            """)
+
         rows = cur.fetchall()
-        out = []
+
+        data = []
         for r in rows:
-            expiry = r[16]
-            if expiry:
-                expiry = expiry.isoformat() if hasattr(expiry, "isoformat") else str(expiry)
-            out.append({
-                "code": r[0], "name": r[1], "catagory": r[2], "product": r[3],
-                "brand": r[4], "unit": r[5], "taxcode": r[6],
-                "productcode": r[7], "barcode": r[8],
-                "quantity": _to_float(r[9]), "cost": _to_float(r[10]),
-                "bmrp": _to_float(r[11]), "salesprice": _to_float(r[12]),
-                "secondprice": _to_float(r[13]), "thirdprice": _to_float(r[14]),
-                "supplier": r[15], "expirydate": expiry
+            data.append({
+                "item_code": r[0],
+                "item_name": r[1],
+                "rate": r[2],
+                "rate1": r[3],
+                "rate2": r[4],
+                "kitchen": r[5],
+                "activity": r[6],
+                "image": r[7],
+
+                # ✅ ONLY CATEGORY NAME
+                "category": r[8],
+
+                "taxper": r[9],
+                "longname": r[10]
             })
-        return JsonResponse({"status": "success", "count": len(out), "data": out})
+
+        return JsonResponse({
+            "status": "success",
+            "count": len(data),
+            "items": data
+        })
+
     except Exception as e:
-        logging.exception("get_product_details failed")
-        return JsonResponse({"detail": f"Failed to fetch product details: {e}"}, status=500)
+        return JsonResponse(
+            {"status": "error", "detail": str(e)},
+            status=500
+        )
+
     finally:
         try:
-            cur.close(); conn.close()
+            cur.close()
+            conn.close()
         except Exception:
             pass
 
 
 
+@jwt_required
+@require_http_methods(["GET"])
+def get_dine_tables(request):
+    """
+    GET /dine-tables/
+    GET /dine-tables/?tableno=T01
+    """
+
+    tableno = request.GET.get("tableno")
+
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+
+        if tableno:
+            # 🔹 Particular table
+            cur.execute("""
+                SELECT
+                    tableno,
+                    description,
+                    section
+                FROM dine_tables
+                WHERE tableno = ?
+            """, (tableno,))
+        else:
+            # 🔹 All tables
+            cur.execute("""
+                SELECT
+                    tableno,
+                    description,
+                    section
+                FROM dine_tables
+            """)
+
+        rows = cur.fetchall()
+
+        data = []
+        for r in rows:
+            data.append({
+                "tableno": r[0],
+                "description": r[1],
+                "section": r[2]
+            })
+
+        return JsonResponse({
+            "status": "success",
+            "count": len(data),
+            "tables": data
+        })
+
+    except Exception as e:
+        return JsonResponse(
+            {"status": "error", "detail": str(e)},
+            status=500
+        )
+
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+
+@jwt_required
+@require_http_methods(["GET"])
+def get_user_settings(request):
+    """
+    GET /user-settings/
+    GET /user-settings/?uid=USER01
+    """
+
+    uid = request.GET.get("uid")
+
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+
+        if uid:
+            # 🔹 Particular user
+            cur.execute("""
+                SELECT
+                    uid,
+                    code
+                FROM acc_userssettings
+                WHERE uid = ?
+            """, (uid,))
+        else:
+            # 🔹 All users settings
+            cur.execute("""
+                SELECT
+                    uid,
+                    code
+                FROM acc_userssettings
+            """)
+
+        rows = cur.fetchall()
+
+        data = []
+        for r in rows:
+            data.append({
+                "uid": r[0],
+                "code": r[1]
+            })
+
+        return JsonResponse({
+            "status": "success",
+            "count": len(data),
+            "settings": data
+        })
+
+    except Exception as e:
+        return JsonResponse(
+            {"status": "error", "detail": str(e)},
+            status=500
+        )
+
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
 
 
+@jwt_required
+@require_http_methods(["GET"])
+def get_dine_categories(request):
+    """
+    GET /dine-categories/
+    GET /dine-categories/?catagorycode=FD
+    """
 
+    catagorycode = request.GET.get("catagorycode")
 
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
 
-# SELECT
-#     po.orderno,
-#     po.orderdate,
-#     po.supplier,
+        if catagorycode:
+            # 🔹 Particular category
+            cur.execute("""
+                SELECT
+                    catagorycode,
+                    name
+                FROM dine_catagory
+                WHERE catagorycode = ?
+            """, (catagorycode,))
+        else:
+            # 🔹 All categories
+            cur.execute("""
+                SELECT
+                    catagorycode,
+                    name
+                FROM dine_catagory
+            """)
 
-#     -- MASTER FIELDS
-#     po.total,
-#     po.discount,
-#     po.pnfcharges,
-#     po.exceiseduty,
-#     po.salestax,
-#     po.freightcharge,
-#     po.othercharges,
-#     po.cessonED,
-#     po.cess,
+        rows = cur.fetchall()
 
-#     -- DETAILS FIELDS
-#     pd.slno AS detail_slno,
-#     pd.item AS product_code_or_name,
-#     pd.barcode,
-#     pd.qty AS quantity,
-#     pd.rate AS cost,
-#     pd.mrp,
-#     pd.taxcode,
-#     pd.ioflag,
-#     pd.itemdetails AS manual_item,     -- 🆕 Manual entry name
+        data = []
+        for r in rows:
+            data.append({
+                "catagorycode": r[0],
+                "name": r[1]
+            })
 
-#     -- PRODUCT TABLE FIELDS
-#     p.name        AS product_name,
-#     p.catagory,
-#     p.brand,
-#     p.unit,
-#     p.taxcode     AS product_taxcode,
+        return JsonResponse({
+            "status": "success",
+            "count": len(data),
+            "categories": data
+        })
 
-#     -- BATCH FIELDS
-#     pb.productcode,
-#     pb.quantity   AS batch_quantity,
-#     pb.cost       AS batch_cost,
-#     pb.bmrp       AS batch_mrp,
-#     pb.salesprice AS batch_salesprice,
-#     pb.secondprice,
-#     pb.thirdprice,
-#     pb.expirydate
+    except Exception as e:
+        return JsonResponse(
+            {"status": "error", "detail": str(e)},
+            status=500
+        )
 
-# FROM acc_purchaseordermaster po
-# JOIN acc_purchaseorderdetails pd 
-#       ON pd.masterslno = po.slno
-
-# LEFT JOIN acc_productbatch pb 
-#       ON pb.barcode = pd.barcode
-
-# LEFT JOIN acc_product p 
-#       ON p.code = pb.productcode
-
-# WHERE po.orderdate = TODAY()        -- 🔥 only today's orders
-# ORDER BY pd.slno DESC;
-
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass

@@ -1,7 +1,7 @@
 {
   "ip": "auto",
   "port": 8000,
-  "dsn": "pktc",
+  "dsn": "TEAPOT",
   "auto_start": true,
   "log_level": "INFO",
   "all_ips": ["192.168.1.35","172.25.240.1"]
